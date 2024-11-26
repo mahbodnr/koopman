@@ -12,12 +12,12 @@ from matplotlib import pyplot as plt
 
 # from kooplearn.models.feature_maps.nn import NNFeatureMap
 from nnfeaturemap import NNFeatureMap
-from kooplearn.data import traj_to_contexts
+from kooplearn.data import traj_to_contexts, TensorContextDataset
 from kooplearn.nn import DPLoss
 from kooplearn.nn.data import collate_context_dataset
+# from kooplearn.models import Nonlinear
+from nonlinear import Nonlinear
 from tqdm import tqdm
-from kooplearn.models import Linear, Nonlinear, Kernel
-from sklearn.gaussian_process.kernels import RBF
 
 import torch.autograd as autograd
 
@@ -38,6 +38,28 @@ def forward_iteration(f, x0, max_iter=50, tol=1e-2):
     return f0, res
 
 
+class KoopmanNet(nn.Module):
+    def __init__(self):
+        super(KoopmanNet, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU()
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
+
+
 class SimpleNN(nn.Module):
     def __init__(self):
         super(SimpleNN, self).__init__()
@@ -46,10 +68,11 @@ class SimpleNN(nn.Module):
         self.fc_deq_z = nn.Linear(64, 64)
         self.deq_iterations = 50
         self.fc3 = nn.Linear(64, 10)
+        self.koopman_net = KoopmanNet()
         self.koopman_t = 100
-        self.plot_eig = False
+        self.koopman_critarion = nn.MSELoss()
 
-
+        
     def deq_f(self, z, x):
         return torch.tanh(x + self.fc_deq_z(z))
 
@@ -63,25 +86,14 @@ class SimpleNN(nn.Module):
                 deq_history.append(z.clone().detach())
 
             h = torch.stack(deq_history)  # [deq_iterations, B, 64]
-            selected_batch_idx = 0
-            h = h.cpu()
-            ctx = traj_to_contexts(h, backend="torch")
-            kernel_model = Kernel(
-                RBF(length_scale=0.5), 
-                reduced_rank = True, 
-                rank = 10, 
-                tikhonov_reg = 1e-8,
-            ).fit(ctx[..., selected_batch_idx, :])
-            pred = kernel_model.predict(ctx[-1], t=self.koopman_t)[-1,0]
-            pred = torch.from_numpy(pred).to(z)
+            r, decoded = self.koopman_net(h)
+            self.koopman_loss = self.koopman_critarion(decoded, h)
+            r = r.transpose(0, 1) # [B, deq_iterations, 16]
+            r = r + 1e-5 * torch.randn_like(r)
+            koopman = torch.linalg.lstsq(r[:, :-1], r[:, 1:])
+            pred = r[:,-1].unsqueeze(1) @ torch.linalg.matrix_power(koopman.solution, self.koopman_t)
+            pred = self.koopman_net.decoder(pred.squeeze(1))
 
-            if self.plot_eig:
-                eigs = kernel_model.eig(ctx, ctx)
-                plt.scatter(eigs.real, eigs.imag)
-                theta = np.linspace(0, 2*np.pi, 100)
-                plt.plot(np.cos(theta), np.sin(theta), 'k--')
-                plt.axis('equal')
-                plt.savefig(f"imgs/eigs{epoch}.png")
 
         z = self.deq_f(pred, x_inj)
 
@@ -107,6 +119,25 @@ class SimpleNN(nn.Module):
         x = self.fc3(x)
         return x
 
+    def eig(self, x):
+        x = x.view(-1, 28 * 28)
+        x = torch.relu(self.fc1(x))
+        with torch.no_grad():
+            z = torch.zeros_like(x)
+            x_inj = self.fc_deq_x(x)
+            deq_history = []
+            for _ in range(self.deq_iterations):
+                z = self.deq_f(z, x_inj)
+                deq_history.append(z.clone().detach())
+
+            h = torch.stack(deq_history)  # [deq_iterations, B, 64]
+            self.koopman_loss = self.feature_map.fit(h)
+            ctx = traj_to_contexts(h, backend="torch")
+            koopman = Nonlinear(
+                self.feature_map, reduced_rank=True, rank=10, tikhonov_reg=1e-3
+            ).fit(ctx)
+            return koopman.eig()
+
 def evaluate(model, dataloader, epoch=None):
     correct = 0
     total = 0
@@ -125,9 +156,13 @@ def evaluate(model, dataloader, epoch=None):
             plt.savefig(f"imgs/conv{epoch}.png")
             plt.close()
 
-            model.plot_eig = True
-            model(images)
-            model.plot_eig = False
+            # eigs = model.eig(images)
+            # plt.scatter(eigs.real, eigs.imag)
+            # theta = np.linspace(0, 2*np.pi, 100)
+            # plt.plot(np.cos(theta), np.sin(theta), 'k--')
+            # plt.axis('equal')
+            # plt.savefig(f"imgs/eigs{epoch}.png")
+            # plt.close()
 
     return 100 * correct / total
 
@@ -162,12 +197,16 @@ for epoch in range(50):  # 5 epochs
 
         outputs = model(inputs)
         loss = criterion(outputs, labels)
+        # print(f"loss: {loss}")
+        # print(f"koopman_loss: {model.koopman_loss}")
+        koopman_loss = model.koopman_loss * 1000
+        loss += koopman_loss
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
         if i % 100 == 99:  # Print every 100 mini-batches
-            print(f"[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 100:.3f}")
+            print(f"[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 100:.3f}, koopman_loss: {koopman_loss}, classifier_loss: {loss - koopman_loss}")
             running_loss = 0.0
 
     acc = evaluate(model, testloader, epoch)
