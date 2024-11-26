@@ -41,13 +41,23 @@ def forward_iteration(f, x0, max_iter=50, tol=1e-2):
 class KoopmanNet(nn.Module):
     def __init__(self):
         super(KoopmanNet, self).__init__()
-        self.fc1 = nn.Linear(64, 32)
-        self.fc2 = nn.Linear(32, 16)
+        self.encoder = nn.Sequential(
+            nn.Linear(64, 32),
+            nn.ReLU(),
+            nn.Linear(32, 16),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU()
+        )
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))
-        x = torch.relu(self.fc2(x))
-        return x
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return encoded, decoded
 
 
 class SimpleNN(nn.Module):
@@ -60,11 +70,7 @@ class SimpleNN(nn.Module):
         self.fc3 = nn.Linear(64, 10)
         self.koopman_net = KoopmanNet()
         self.koopman_t = 100
-        self.koopman_critarion = DPLoss(
-            relaxed=True, metric_deformation=1, center_covariances=False
-        )
-        self.feature_map = NNFeatureMap(self.koopman_net, self.koopman_critarion)
-
+        self.koopman_critarion = nn.MSELoss()
     def deq_f(self, z, x):
         return torch.tanh(x + self.fc_deq_z(z))
 
@@ -78,12 +84,14 @@ class SimpleNN(nn.Module):
                 deq_history.append(z.clone().detach())
 
             h = torch.stack(deq_history)  # [deq_iterations, B, 64]
-            r, self.koopman_loss = self.feature_map.fit(h)
-            ctx = traj_to_contexts(h, backend="torch")
-            koopman = Nonlinear(
-                self.feature_map, reduced_rank=True, rank=10, tikhonov_reg=1e-6
-            ).fit(ctx)
-            pred = koopman.predict(ctx, t=self.koopman_t, predict_observables=True)[-1].squeeze(0)
+            r, decoded = self.koopman_net(h)
+            self.koopman_loss = self.koopman_critarion(decoded, h)
+            r = r.transpose(0, 1) # [B, deq_iterations, 16]
+            r = r + 1e-5 * torch.randn_like(r)
+            koopman = torch.linalg.lstsq(r[:, :-1], r[:, 1:])
+            pred = r[:,-1].unsqueeze(1) @ torch.linalg.matrix_power(koopman.solution, self.koopman_t)
+            pred = self.koopman_net.decoder(pred.squeeze(1))
+
 
         z = self.deq_f(pred, x_inj)
 
@@ -189,13 +197,14 @@ for epoch in range(50):  # 5 epochs
         loss = criterion(outputs, labels)
         # print(f"loss: {loss}")
         # print(f"koopman_loss: {model.koopman_loss}")
-        loss += model.koopman_loss 
+        koopman_loss = model.koopman_loss * 1000
+        loss += koopman_loss
         loss.backward()
         optimizer.step()
 
         running_loss += loss.item()
         if i % 100 == 99:  # Print every 100 mini-batches
-            print(f"[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 100:.3f}, koopman_loss: {model.koopman_loss}, classifier_loss: {loss - model.koopman_loss}")
+            print(f"[Epoch {epoch + 1}, Batch {i + 1}] loss: {running_loss / 100:.3f}, koopman_loss: {koopman_loss}, classifier_loss: {loss - koopman_loss}")
             running_loss = 0.0
 
     acc = evaluate(model, testloader, epoch)

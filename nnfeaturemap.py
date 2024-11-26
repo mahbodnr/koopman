@@ -74,7 +74,7 @@ class NNFeatureMap(TrainableFeatureMap):
 
         self._is_fitted = True
 
-        return loss
+        return representations, loss
 
     def __call__(self, X: torch.Tensor) -> torch.Tensor:
         return self.encoder(X)
